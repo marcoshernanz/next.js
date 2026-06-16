@@ -40,7 +40,8 @@ use turbopack_core::{
     ident::Layer,
     issue::{CollectibleIssuesExt, IssueFilter},
     module_graph::{
-        ModuleGraph, SingleModuleGraph, binding_usage_info::compute_binding_usage_info,
+        ModuleGraph, ModuleGraphOptions, SingleModuleGraph,
+        binding_usage_info::compute_binding_usage_info,
     },
     reference_type::{InnerAssets, ReferenceType},
     resolve::{
@@ -513,8 +514,10 @@ async fn run_test_operation(prepared_test: ResolvedVc<PreparedTest>) -> Result<V
 
     let single_graph = SingleModuleGraph::new_with_entries(
         entries.graph_entries().to_resolved().await?,
-        false,
-        true,
+        ModuleGraphOptions {
+            include_binding_usage: true,
+            ..Default::default()
+        },
     );
     let mut module_graph = ModuleGraph::from_graphs(vec![single_graph], None);
 

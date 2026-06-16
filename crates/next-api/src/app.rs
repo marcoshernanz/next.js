@@ -58,7 +58,7 @@ use turbopack_core::{
     ident::{AssetIdent, Layer},
     module::Module,
     module_graph::{
-        GraphEntries, ModuleGraph, SingleModuleGraph, VisitedModules,
+        GraphEntries, ModuleGraph, ModuleGraphOptions, SingleModuleGraph, VisitedModules,
         binding_usage_info::compute_binding_usage_info,
         chunk_group_info::{ChunkGroup, ChunkGroupEntry},
     },
@@ -880,6 +880,13 @@ impl AppProject {
             let next_mode_ref = next_mode.await?;
             let should_trace = next_mode_ref.is_production();
             let should_read_binding_usage = next_mode_ref.is_production();
+            // Store idents: NFT tracing reads per-page graphs via `module_ident`, which requires
+            // them (and bails otherwise).
+            let graph_options = ModuleGraphOptions {
+                include_idents: true,
+                include_traced: should_trace,
+                include_binding_usage: should_read_binding_usage,
+            };
 
             // Implements layout segment optimization to compute a graph "chain" for each layout
             // segment
@@ -919,8 +926,7 @@ impl AppProject {
                             ),
                         ]),
                         visited_modules,
-                        should_trace,
-                        should_read_binding_usage,
+                        graph_options,
                     );
                     graphs.push(graph);
                     visited_modules = VisitedModules::concatenate(visited_modules, graph);
@@ -938,8 +944,7 @@ impl AppProject {
                                 ResolvedVc::upcast(*module),
                             )]),
                             visited_modules,
-                            should_trace,
-                            should_read_binding_usage,
+                            graph_options,
                         );
                         graphs.push(graph);
                         let is_layout = module.server_path().await?.file_stem() == Some("layout");
@@ -961,8 +966,7 @@ impl AppProject {
                 let graph = SingleModuleGraph::new_with_entries_visited_intern(
                     GraphEntries::from_chunk_groups(vec![rsc_entry_chunk_group]),
                     visited_modules,
-                    should_trace,
-                    should_read_binding_usage,
+                    graph_options,
                 );
                 graphs.push(graph);
                 visited_modules = VisitedModules::concatenate(visited_modules, graph);
@@ -972,8 +976,7 @@ impl AppProject {
                 let additional_module_graph = SingleModuleGraph::new_with_entries_visited_intern(
                     additional_entries.owned().await?,
                     visited_modules,
-                    should_trace,
-                    should_read_binding_usage,
+                    graph_options,
                 );
                 graphs.push(additional_module_graph);
 

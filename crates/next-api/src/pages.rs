@@ -54,7 +54,7 @@ use turbopack_core::{
     ident::{AssetIdent, Layer},
     module::Module,
     module_graph::{
-        GraphEntries, ModuleGraph, SingleModuleGraph, VisitedModules,
+        GraphEntries, ModuleGraph, ModuleGraphOptions, SingleModuleGraph, VisitedModules,
         binding_usage_info::compute_binding_usage_info,
         chunk_group_info::{ChunkGroup, ChunkGroupEntry},
     },
@@ -719,8 +719,14 @@ impl PageEndpoint {
         if *project.per_page_module_graph().await? {
             let next_mode = project.next_mode();
             let next_mode_ref = next_mode.await?;
-            let should_trace = next_mode_ref.is_production();
-            let should_read_binding_usage = next_mode_ref.is_production();
+            let is_production = next_mode_ref.is_production();
+            // Store idents: NFT tracing reads per-page graphs via `module_ident`, which requires
+            // them (and bails otherwise).
+            let graph_options = ModuleGraphOptions {
+                include_idents: is_production,
+                include_traced: is_production,
+                include_binding_usage: is_production,
+            };
 
             let ssr_chunk_module = self.internal_ssr_chunk_module().await?;
             // Implements layout segment optimization to compute a graph "chain" for document, app,
@@ -737,8 +743,7 @@ impl PageEndpoint {
                 let graph = SingleModuleGraph::new_with_entries_visited_intern(
                     GraphEntries::from_chunk_groups(vec![ChunkGroupEntry::Shared(module)]),
                     visited_modules,
-                    should_trace,
-                    should_read_binding_usage,
+                    graph_options,
                 );
                 graphs.push(graph);
                 visited_modules = VisitedModules::concatenate(visited_modules, graph);
@@ -749,8 +754,7 @@ impl PageEndpoint {
                     ssr_chunk_module.ssr_module,
                 ])]),
                 visited_modules,
-                should_trace,
-                should_read_binding_usage,
+                graph_options,
             );
             graphs.push(graph);
 

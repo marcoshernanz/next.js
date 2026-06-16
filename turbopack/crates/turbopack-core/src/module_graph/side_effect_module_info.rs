@@ -46,7 +46,7 @@ async fn compute_side_effect_free_module_info_single(
         .iter_reachable_nodes()?
         .map(async |node| {
             Ok(match node {
-                SingleModuleGraphNode::Module(module) => {
+                SingleModuleGraphNode::Module { module, .. } => {
                     // This turbo task always has a cache hit since it is called when building the
                     // module graph. we could consider moving this information
                     // into to the module graph, but then changes would invalidate the whole graph.

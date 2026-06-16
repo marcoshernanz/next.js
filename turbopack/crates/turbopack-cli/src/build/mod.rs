@@ -34,7 +34,7 @@ use turbopack_core::{
     issue::{IssueReporter, IssueSeverity, handle_issues},
     module::Module,
     module_graph::{
-        GraphEntries, ModuleGraph, SingleModuleGraph,
+        GraphEntries, ModuleGraph, ModuleGraphOptions, SingleModuleGraph,
         binding_usage_info::compute_binding_usage_info,
         chunk_group_info::{ChunkGroup, ChunkGroupEntry},
     },
@@ -318,8 +318,10 @@ async fn build_internal(
     let single_graph = SingleModuleGraph::new_with_entries(
         GraphEntries::from_chunk_groups(vec![ChunkGroupEntry::Entry(entries.clone())])
             .resolved_cell(),
-        false,
-        true,
+        ModuleGraphOptions {
+            include_binding_usage: true,
+            ..Default::default()
+        },
     );
     let mut module_graph = ModuleGraph::from_graphs(vec![single_graph], None);
     let binding_usage = compute_binding_usage_info(module_graph, true);
