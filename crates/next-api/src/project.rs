@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -37,7 +37,7 @@ use tracing::{Instrument, field::Empty};
 use turbo_rcstr::{RcStr, rcstr};
 use turbo_tasks::{
     Completion, Completions, FxIndexMap, NonLocalValue, OperationValue, OperationVc, ReadRef,
-    ResolvedVc, State, TransientInstance, TryFlatJoinIterExt, TryJoinIterExt, Vc,
+    ResolvedVc, State, TraitRef, TransientInstance, TryFlatJoinIterExt, TryJoinIterExt, Vc,
     debug::ValueDebugFormat, fxindexmap, trace::TraceRawVcs,
 };
 use turbo_tasks_env::{EnvMap, ProcessEnv};
@@ -80,7 +80,8 @@ use turbopack_core::{
     reference_type::{CommonJsReferenceSubType, ReferenceType},
     resolve::{FindContextFileResult, find_context_file},
     version::{
-        NotFoundVersion, OptionVersionedContent, Update, Version, VersionState, VersionedContent,
+        NotFoundVersion, OptionVersionedContent, PartialUpdate, TotalUpdate, Update, Version,
+        VersionState, VersionedContent,
     },
 };
 #[cfg(feature = "process_pool")]
@@ -91,6 +92,9 @@ use turbopack_node::worker_threads_backend;
 use turbopack_nodejs::NodeJsChunkingContext;
 
 use crate::{
+    aggregate_hmr::{
+        AggregateHmrVersion, build_aggregate_hmr_version, merge_ecmascript_merged_update,
+    },
     app::{AppProject, OptionAppProject},
     empty::EmptyEndpoint,
     entrypoints::Entrypoints,
@@ -2486,14 +2490,235 @@ impl Project {
         }
     }
 
+    /// Aggregate counterpart to [`Self::hmr_version_state`]: one [`VersionState`]
+    /// covering every HMR-eligible chunk under `target`'s root. See
+    /// [`Self::all_hmr_update`].
+    #[turbo_tasks::function]
+    pub async fn all_hmr_version_state(
+        self: ResolvedVc<Self>,
+        target: HmrTarget,
+        session: TransientInstance<()>,
+    ) -> Result<Vc<VersionState>> {
+        if target == HmrTarget::Client {
+            bail!("all_hmr_version_state is not yet implemented for the client target");
+        }
+
+        // The session argument keeps this from caching across sessions.
+        let _ = session;
+
+        #[tracing::instrument(
+            level = "info",
+            name = "get aggregate HMR version",
+            skip_all,
+            fields(target = %target),
+        )]
+        #[turbo_tasks::function(operation, root)]
+        async fn aggregate_hmr_version_operation(
+            this: ResolvedVc<Project>,
+            target: HmrTarget,
+        ) -> Result<Vc<Box<dyn Version>>> {
+            let names = this.hmr_chunk_names(target).await?;
+            let pairs: Vec<(RcStr, ResolvedVc<Box<dyn VersionedContent>>)> = names
+                .iter()
+                .map(|name| {
+                    let name = name.clone();
+                    async move {
+                        let content = this.hmr_content(name.clone(), target).await?;
+                        Ok::<_, anyhow::Error>((*content).as_ref().map(|&c| (name, c)))
+                    }
+                })
+                .try_flat_join()
+                .await?;
+            // Match per-chunk [`Self::hmr_version_state`] semantics: when no
+            // chunks exist yet (e.g. before any endpoints have been written),
+            // seed with `NotFoundVersion`. The first non-empty `all_hmr_update`
+            // tick will then naturally produce `Update::Total` via the existing
+            // "wrong version type" escape hatch, advancing the state.
+            if pairs.is_empty() {
+                return Ok(Vc::upcast(NotFoundVersion::new()));
+            }
+            Ok(Vc::upcast(build_aggregate_hmr_version(&pairs).await?))
+        }
+        let version_op = aggregate_hmr_version_operation(self, target);
+
+        // INVALIDATION: untracked initial read; the subscription drives invalidation.
+        let state = VersionState::new(
+            version_op
+                .read_trait_strongly_consistent()
+                .untracked()
+                .await?,
+        )
+        .await?;
+        Ok(state)
+    }
+
+    /// Aggregate counterpart to [`Self::hmr_update`]: a single `Update` whose
+    /// `EcmascriptMergedUpdate` is the union of per-chunk diffs under
+    /// `target`'s root.
+    ///
+    /// All-or-nothing restart: any chunk needing `Total`/`Missing` escalates
+    /// the whole batch to `Total` (the runtime can't partially restart). New
+    /// chunks absent from `from` are skipped; the runtime require()s them on
+    /// demand.
+    #[turbo_tasks::function]
+    pub async fn all_hmr_update(
+        self: Vc<Self>,
+        target: HmrTarget,
+        from: Vc<VersionState>,
+    ) -> Result<Vc<Update>> {
+        if target == HmrTarget::Client {
+            bail!("all_hmr_update is not yet implemented for the client target");
+        }
+
+        let names = self.hmr_chunk_names(target).await?;
+        let pairs: Vec<(RcStr, ResolvedVc<Box<dyn VersionedContent>>)> = names
+            .iter()
+            .map(|name| {
+                let name = name.clone();
+                async move {
+                    let content = self.hmr_content(name.clone(), target).await?;
+                    Ok::<_, anyhow::Error>((*content).as_ref().map(|&c| (name, c)))
+                }
+            })
+            .try_flat_join()
+            .await?;
+
+        // No chunks to diff yet (e.g. before any endpoints have been written).
+        // Return `Update::None` so the NAPI dispatcher leaves the seeded
+        // `NotFoundVersion` in place; the next tick with non-empty `pairs` will
+        // then hit the "wrong version type → Total" path below and advance state
+        // to a populated `AggregateHmrVersion`.
+        if pairs.is_empty() {
+            return Ok(Update::None.cell());
+        }
+
+        // Build `to` up front so we can return it on every escape hatch below.
+        let to_aggregate = build_aggregate_hmr_version(&pairs).await?;
+        let to_ref = Vc::upcast::<Box<dyn Version>>(to_aggregate)
+            .into_trait_ref()
+            .await?;
+
+        // First tick / wrong version type (e.g. seeded `NotFoundVersion` when
+        // no chunks existed yet) → Total so the NAPI dispatcher advances state
+        // via `state.set(to)`. Subsequent ticks see a real `AggregateHmrVersion`
+        // and take the diff path below.
+        let from_resolved = from.get().to_resolved().await?;
+        let Some(from_aggregate) =
+            ResolvedVc::try_downcast_type::<AggregateHmrVersion>(from_resolved)
+        else {
+            return Ok(Update::Total(TotalUpdate { to: to_ref }).cell());
+        };
+        let from_aggregate = from_aggregate.await?;
+
+        // Diff each chunk that exists in `from` against its current version.
+        // Chunks that are new in `pairs` (no entry in `from.by_path`) are
+        // tracked separately: we still want state to advance to include them in
+        // `to`, but they don't appear in the per-chunk diff (no `prev` to diff
+        // against). They'll be `require()`d fresh on the next request that
+        // touches them; the runtime registers their handler then.
+        let mut has_new_chunks = false;
+        let chunk_updates = pairs
+            .into_iter()
+            .filter_map(|(path, content)| {
+                let Some(prev) = from_aggregate.by_path.get(&path).cloned() else {
+                    has_new_chunks = true;
+                    return None;
+                };
+                Some((path, content, TraitRef::cell(prev)))
+            })
+            .map(|(path, content, prev)| async move {
+                let update = content.update(prev).await?;
+                Ok::<_, anyhow::Error>((path, update))
+            })
+            .try_join()
+            .await?;
+
+        let mut combined_entries = serde_json::Map::new();
+        let mut combined_chunks = serde_json::Map::new();
+        for (_path, update) in chunk_updates {
+            match &*update {
+                Update::None => {}
+                Update::Missing | Update::Total(_) => {
+                    return Ok(Update::Total(TotalUpdate { to: to_ref }).cell());
+                }
+                Update::Partial(PartialUpdate { instruction, .. }) => {
+                    merge_ecmascript_merged_update(
+                        &mut combined_entries,
+                        &mut combined_chunks,
+                        instruction,
+                    );
+                }
+            }
+        }
+
+        if combined_entries.is_empty() && combined_chunks.is_empty() {
+            // Nothing to apply, but if new chunks appeared we still need state
+            // to advance so the next edit involving them can diff against the
+            // expanded baseline. Emit a `Partial` with an empty instruction:
+            // the NAPI dispatcher will call `state.set(to)`, the JS consumer
+            // sees a `partial` event with no entries/chunks and short-circuits
+            // the apply (no handlers needed).
+            if has_new_chunks {
+                let mut combined = serde_json::Map::new();
+                combined.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("EcmascriptMergedUpdate".to_string()),
+                );
+                return Ok(Update::Partial(PartialUpdate {
+                    to: to_ref,
+                    instruction: Arc::new(serde_json::Value::Object(combined)),
+                })
+                .cell());
+            }
+            return Ok(Update::None.cell());
+        }
+
+        // Same shape a single chunk's update would produce; consumer is unchanged.
+        let mut combined = serde_json::Map::new();
+        combined.insert(
+            "type".to_string(),
+            serde_json::Value::String("EcmascriptMergedUpdate".to_string()),
+        );
+        if !combined_entries.is_empty() {
+            combined.insert(
+                "entries".to_string(),
+                serde_json::Value::Object(combined_entries),
+            );
+        }
+        if !combined_chunks.is_empty() {
+            combined.insert(
+                "chunks".to_string(),
+                serde_json::Value::Object(combined_chunks),
+            );
+        }
+
+        Ok(Update::Partial(PartialUpdate {
+            to: to_ref,
+            instruction: Arc::new(serde_json::Value::Object(combined)),
+        })
+        .cell())
+    }
+
     /// Gets a list of all HMR chunk names that can be subscribed to for the
     /// specified target. Used by the dev server to set up server-side HMR
     /// subscriptions for all Node.js App Router entries (pages and route
     /// handlers).
+    ///
+    /// Source map (`.map`) files are excluded: they have no HMR semantics
+    /// (their content fully rewrites on any source change, which would
+    /// otherwise force every per-chunk diff to escalate to `Total`).
     #[turbo_tasks::function]
     pub async fn hmr_chunk_names(self: Vc<Self>, target: HmrTarget) -> Result<Vc<Vec<RcStr>>> {
         if let Some(map) = self.await?.versioned_content_map {
-            Ok(map.keys_in_path(self.hmr_root_path(target).owned().await?))
+            let names = map
+                .keys_in_path(self.hmr_root_path(target).owned().await?)
+                .await?;
+            let filtered: Vec<RcStr> = names
+                .iter()
+                .filter(|name| !name.ends_with(".map"))
+                .cloned()
+                .collect();
+            Ok(Vc::cell(filtered))
         } else {
             bail!("must be in dev mode to hmr")
         }

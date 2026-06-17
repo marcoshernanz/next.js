@@ -321,6 +321,13 @@ export interface Project {
     TurbopackResult<RawEntrypoints | {}>
   >
 
+  allHmrEvents(
+    target: import('./index').HmrTarget.Client
+  ): AsyncIterableIterator<TurbopackResult<Update>>
+  allHmrEvents(
+    target: import('./index').HmrTarget.Server
+  ): AsyncIterableIterator<TurbopackResult<NodeJsHmrUpdate>>
+
   hmrEvents(
     identifier: string,
     target: import('./index').HmrTarget.Client
